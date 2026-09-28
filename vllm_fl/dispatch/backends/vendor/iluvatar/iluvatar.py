@@ -477,10 +477,11 @@ class IluvatarBackend(Backend):
                 return AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
             return AttentionBackendEnum.FLASHMLA.get_path()
 
-        # flash_attn is not available on iluvatar. Use TRITON_ATTN (the vllm
-        # default). The tl.make_tensor_descriptor stub and perf model patches
-        # are already applied at module level (above), so triton JIT's
-        # DependencyFinder can hash the kernel without AttributeError on
-        # triton < 3.3.  The kernel itself uses USE_TD=False at runtime, so
-        # the stub is never called.
-        return AttentionBackendEnum.TRITON_ATTN.get_path()
+        # The Iluvatar path keeps vLLM 0.24.0's metadata and KV-cache
+        # contract, while replacing only the unified-attention launch policy
+        # in the vendor namespace. Unsupported features and 3D decode still
+        # use the original kernel behavior inside the implementation.
+        return (
+            "vllm_fl.dispatch.backends.vendor.iluvatar.impl.attention."
+            "IluvatarAttentionBackend"
+        )
