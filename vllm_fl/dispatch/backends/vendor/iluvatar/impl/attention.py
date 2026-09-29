@@ -43,6 +43,9 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import (
     unified_attention as vllm_unified_attention,
 )
+from vllm_fl.dispatch.backends.vendor.iluvatar.impl.ops.triton_unified_attention_native import (
+    unified_attention as native_tuned_attention,
+)
 from vllm_fl.dispatch.backends.vendor.iluvatar.impl.ops.triton_unified_attention_optimized import (
     unified_attention_optimized as unified_attention,
 )
@@ -54,10 +57,71 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+_NATIVE_2D_ROUTE_LOGGED = False
+_DISPATCH_PROBE_COUNT = 0
 
 
 def _run_unified_attention(**kwargs):
     """Use Split-KV only for supported mixed/prefill workloads."""
+    max_query_len = kwargs["max_seqlen_q"]
+
+    global _DISPATCH_PROBE_COUNT
+    if _DISPATCH_PROBE_COUNT < 8:
+        logger.warning(
+            "Iluvatar attention dispatch probe: max_seqlen_q=%s native_env=%s "
+            "split_env=%s",
+            max_query_len,
+            os.environ.get("ILUVATAR_NATIVE_2D_TUNE", "0"),
+            os.environ.get("ILUVATAR_SPLIT_KV", "0"),
+        )
+        _DISPATCH_PROBE_COUNT += 1
+
+    # Opt-in native 2D tuning. This preserves vLLM's request batching and
+    # launch shape; only the copied, version-pinned 2D kernel parameters are
+    # changed. Decode remains on the original vLLM path.
+    native_marker = os.path.exists("/tmp/iluvatar_native_2d.enable")
+    native_2d_tuning = os.environ.get("ILUVATAR_NATIVE_2D_TUNE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # vLLM V1's EngineCore does not preserve arbitrary experiment-only
+    # environment variables in this container.  Keep the opt-in default off,
+    # but allow an explicit diagnostic marker for isolated 9032 experiments.
+    native_2d_tuning = native_2d_tuning or native_marker
+    if native_2d_tuning and max_query_len > 1:
+        global _NATIVE_2D_ROUTE_LOGGED
+        if not _NATIVE_2D_ROUTE_LOGGED:
+            logger.info(
+                "Iluvatar native 2D attention enabled: BLOCK_M=%s TILE=%s "
+                "warps=%s stages=%s max_query_len=%s",
+                os.environ.get("ILUVATAR_2D_BLOCK_M", "default"),
+                os.environ.get("ILUVATAR_2D_TILE_SIZE", "default"),
+                os.environ.get("ILUVATAR_2D_NUM_WARPS", "default"),
+                os.environ.get("ILUVATAR_2D_NUM_STAGES", "default"),
+                max_query_len,
+            )
+            _NATIVE_2D_ROUTE_LOGGED = True
+        block_m = int(
+            os.environ.get("ILUVATAR_2D_BLOCK_M", "128" if native_marker else "0")
+        ) or None
+        tile_size = int(
+            os.environ.get("ILUVATAR_2D_TILE_SIZE", "16" if native_marker else "0")
+        ) or None
+        num_warps = int(
+            os.environ.get("ILUVATAR_2D_NUM_WARPS", "8" if native_marker else "0")
+        ) or None
+        num_stages = int(
+            os.environ.get("ILUVATAR_2D_NUM_STAGES", "2" if native_marker else "0")
+        ) or None
+        return native_tuned_attention(
+            **kwargs,
+            block_m_override=block_m,
+            tile_size_prefill_override=tile_size,
+            launch_num_warps_override=num_warps,
+            launch_num_stages_override=num_stages,
+        )
+
     use_optimized = os.environ.get("ILUVATAR_USE_OPTIMIZED", "0").lower() in (
         "1",
         "true",
@@ -69,7 +133,6 @@ def _run_unified_attention(**kwargs):
         "yes",
     )
     enabled = use_optimized and split_kv_enabled
-    max_query_len = kwargs["max_seqlen_q"]
     unsupported = (
         kwargs.get("kv_quant_mode", KVQuantMode.NONE) != KVQuantMode.NONE
         or kwargs.get("alibi_slopes") is not None
