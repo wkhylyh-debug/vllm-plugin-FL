@@ -167,11 +167,10 @@ def build_common_args(model, port, served_model_name=None):
         model,
         "--endpoint",
         "/v1/completions",
-        # Prefer an explicit base URL. The installed vLLM CLI in the
-        # Iluvatar image can leave --host/--port at their defaults after
-        # plugin initialization, which silently targets port 8000.
-        "--base-url",
-        f"http://127.0.0.1:{port}",
+        "--host",
+        "localhost",
+        "--port",
+        str(port),
         "--dataset-name",
         "random",
         "--ignore-eos",
