@@ -233,8 +233,12 @@ def kernel_unified_attention_iluvatar_native(
     BLOCK_Q: tl.constexpr,
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
+    SCALAR_BLOCK_LOOKUP: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     USE_FP8: tl.constexpr,
+    MIXED_PREFILL_ONLY: tl.constexpr,
+    MIXED_DECODE_ONLY: tl.constexpr,
     # Toggles 2D vs 3D layout.  The 2D path runs the full sequence in one
     # tile loop and writes to ``output_ptr``.  The 3D path scopes the loop
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
@@ -288,15 +292,29 @@ def kernel_unified_attention_iluvatar_native(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
 
-    (
-        seq_idx,
-        q_block_local_idx,
-        cur_batch_in_all_start_index,
-        cur_batch_query_len,
-        seq_len,
-    ) = resolve_seq_and_query_len(
-        query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
-    )
+    if MIXED_DECODE_ONLY:
+        seq_idx = q_block_global_idx
+        q_block_local_idx = 0
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_query_len = (
+            tl.load(query_start_len_ptr + seq_idx + 1)
+            - cur_batch_in_all_start_index
+        )
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
+        if cur_batch_query_len != 1:
+            return
+    else:
+        (
+            seq_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            cur_batch_query_len,
+            seq_len,
+        ) = resolve_seq_and_query_len(
+            query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
+        )
+        if MIXED_PREFILL_ONLY and cur_batch_query_len == 1:
+            return
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -399,13 +417,23 @@ def kernel_unified_attention_iluvatar_native(
     )
 
     # iterate through tiles (now limited to the sliding window range)
-    for j in range(loop_lo, loop_hi):
+    # The loop hint sets its pipeline depth independently of the launch hint.
+    # It does not guarantee an asynchronous copy on every Triton backend.
+    for j in tl.range(loop_lo, loop_hi, num_stages=PIPELINE_STAGES):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if SCALAR_BLOCK_LOOKUP:
+            # A tile contained within one physical block needs one page-table
+            # entry, shared by all K/V rows in its Q-head group.
+            block_idx = tl.load(
+                block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+            ).to(tl.int64)
+            physical_block_idx = tl.full((TILE_SIZE,), 0, tl.int64) + block_idx
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
         if USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
@@ -822,6 +850,9 @@ def unified_attention(
     tile_size_prefill_override: int | None = None,
     launch_num_warps_override: int | None = None,
     launch_num_stages_override: int | None = None,
+    pipeline_stages_override: int | None = None,
+    scalar_block_lookup_override: bool = False,
+    mixed_dual_launch_override: bool = False,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -939,6 +970,17 @@ def unified_attention(
     if max_seqlen_q > 1 and tile_size_prefill_override is not None:
         TILE_SIZE_PREFILL = int(tile_size_prefill_override)
 
+    pipeline_stages = 1
+    if max_seqlen_q > 1 and pipeline_stages_override is not None:
+        pipeline_stages = int(pipeline_stages_override)
+        if pipeline_stages < 1 or pipeline_stages > 4:
+            raise ValueError("pipeline_stages_override must be in [1, 4]")
+
+    scalar_block_lookup = max_seqlen_q > 1 and scalar_block_lookup_override
+    if scalar_block_lookup and (TILE_SIZE_PREFILL > block_size or
+                                block_size % TILE_SIZE_PREFILL):
+        raise ValueError("scalar block lookup requires a tile within one KV block")
+
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
     # size (32) is larger than a common ``block_size=16``, so clamp it
@@ -1040,7 +1082,8 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
-    kernel_unified_attention_iluvatar_native[grid](
+    mixed_dual_launch = mixed_dual_launch_override and max_seqlen_q > 1 and not use_3d
+    kernel_kwargs = dict(
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1103,8 +1146,12 @@ def unified_attention(
         BLOCK_Q=BLOCK_Q,
         num_seqs=num_seqs,
         BLOCK_M=BLOCK_M,
+        PIPELINE_STAGES=pipeline_stages,
+        SCALAR_BLOCK_LOOKUP=scalar_block_lookup,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
+        MIXED_PREFILL_ONLY=mixed_dual_launch,
+        MIXED_DECODE_ONLY=False,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
@@ -1112,8 +1159,21 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
-        **launch_kwargs,
     )
+    kernel_unified_attention_iluvatar_native[grid](**kernel_kwargs, **launch_kwargs)
+
+    if mixed_dual_launch:
+        decode_kwargs = dict(kernel_kwargs)
+        decode_kwargs.update(
+            BLOCK_M=max(16, triton.next_power_of_2(num_queries_per_kv)),
+            BLOCK_Q=max(16, triton.next_power_of_2(num_queries_per_kv))
+            // num_queries_per_kv,
+            MIXED_PREFILL_ONLY=False,
+            MIXED_DECODE_ONLY=True,
+        )
+        kernel_unified_attention_iluvatar_native[(num_seqs, num_kv_heads)](
+            **decode_kwargs, **launch_kwargs
+        )
 
     if use_3d:
         reduce_segments[(q.shape[0], num_query_heads)](
